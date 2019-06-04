@@ -1,0 +1,361 @@
+1  import pandas as pd
+2  import numpy as np # linear algebra
+3  import matplotlib.pyplot as plt
+4  from sklearn.feature_extraction.text import TfidfVectorizer
+5  from textblob import TextBlob
+6  from sklearn.cluster import KMeans
+7  from sklearn.mixture import GaussianMixture
+8  from sklearn.metrics import pairwise_distances
+9  from sklearn.decomposition import PCA
+10 from sklearn.preprocessing import normalize
+11 from PIL import Image, ImageDraw
+12 from matplotlib.patches import Ellipse
+13 
+14 from scipy.spatial.distance import cdist
+15 from scipy.stats import multivariate_normal as mvn
+16 
+17 
+18 # open and read from the txt file
+19 path = "C:/Users/marius.cerbauskas/Desktop/sakiniai_gmm.txt"
+20 file = open(path, 'r')
+21 sentences = file.readlines()
+22 
+23 
+24 def textblob_tokenizer(str_input):
+25     blob = TextBlob(str_input.lower())
+26     tokens = blob.words
+27     words = [token.stem() for token in tokens]
+28     return words
+29 
+30 data = sentences
+31 
+32 tf_vec = TfidfVectorizer(tokenizer=textblob_tokenizer,
+33                       stop_words='english',
+34                       norm='l2', # l2 – euclidean distance which is by default
+35                       use_idf=True, # by default its true
+36                       )
+37 tf_matrix = tf_vec.fit_transform(data)
+38 tf_df = pd.DataFrame(tf_matrix.toarray(), columns=tf_vec.get_feature_names())
+39 
+40 tf_idf_norm = normalize(tf_matrix)
+41 tf_idf_array = tf_idf_norm.toarray()
+42 
+43 sklearn_pca = PCA(n_components = 2)
+44 Y_sklearn = sklearn_pca.fit_transform(tf_idf_array)
+45 kmeans = KMeans(n_clusters=3, max_iter=600, algorithm = 'auto')
+46 fitted = kmeans.fit(Y_sklearn)
+47 prediction = kmeans.predict(Y_sklearn)
+48 
+49 plt.figure(figsize=(10, 8))
+50 
+51 def plot_kmeans(kmeans, X, n_clusters=3, rseed=0, ax=None):
+52     labels = kmeans.fit_predict(X)
+53 
+54     # plot the input data
+55     ax = ax or plt.gca()
+56     ax.axis('equal')
+57     ax.scatter(X[:, 0], X[:, 1], c=labels, s=40, cmap='viridis', zorder=2)
+58 
+59     # plot the representation of the KMeans model
+60     centers = kmeans.cluster_centers_
+61     radii = [cdist(X[labels == i], [center]).max()
+62              for i, center in enumerate(centers)]
+63     for c, r in zip(centers, radii):
+64         ax.add_patch(plt.Circle(c, r, fc='#CCCCCC', lw=3, alpha=0.5, zorder=1))
+65 
+66 plot_kmeans(kmeans, Y_sklearn)
+67 plt.show()
+68 
+69 
+70 class GMM:
+71     """ Gaussian Mixture Model
+72 
+73     Parameters
+74     –––––––––––
+75         k: int , number of gaussian distributions
+76 
+77         seed: int, will be randomly set if None
+78 
+79         max_iter: int, number of iterations to run algorithm, default: 200
+80 
+81     Attributes
+82     –––––––––––
+83        centroids: array, k, number_features
+84 
+85        cluster_labels: label for each data point
+86 
+87     """
+88 
+89     def __init__(self, C, n_runs):
+90         self.C = C  # number of Guassians/clusters
+91         self.n_runs = n_runs
+92 
+93     def get_params(self):
+94         return (self.mu, self.pi, self.sigma)
+95 
+96     def calculate_mean_covariance(self, X, prediction):
+97         """Calculate means and covariance of different
+98             clusters from k–means prediction
+99 
+100        Parameters:
+101        ––––––––––––
+102        prediction: cluster labels from k–means
+103
+104        X: N*d numpy array data points
+105
+106        Returns:
+107        –––––––––––––
+108        intial_means: for E–step of EM algorithm
+109
+110        intial_cov: for E–step of EM algorithm
+111
+112        """
+113        d = X.shape[1]
+114        labels = np.unique(prediction)
+115        self.initial_means = np.zeros((self.C, d))
+116        self.initial_cov = np.zeros((self.C, d, d))
+117        self.initial_pi = np.zeros(self.C)
+118
+119        counter = 0
+120        for label in labels:
+121            ids = np.where(prediction == label)  # returns indices
+122            self.initial_pi[counter] = len(ids[0]) / X.shape[0]
+123            self.initial_means[counter, :] = np.mean(X[ids], axis=0)
+124            de_meaned = X[ids] – self.initial_means[counter, :]
+125            Nk = X[ids].shape[0]  # number of data points in current gaussian
+126            self.initial_cov[counter, :, :] = np.dot(self.initial_pi[counter] * de_meaned.T, de_meaned) / Nk
+127            counter += 1
+128        assert np.sum(self.initial_pi) == 1
+129
+130        return (self.initial_means, self.initial_cov, self.initial_pi)
+131
+132    def _initialise_parameters(self, X):
+133        """Implement k–means to find starting
+134            parameter values.
+135        Parameters:
+136        ––––––––––––
+137        X: numpy array of data points
+138
+139        Returns:
+140        ––––––––––
+141        tuple containing initial means and covariance
+142
+143        _initial_means: numpy array: (C*d)
+144
+145        _initial_cov: numpy array: (C,d*d)
+146
+147
+148        """
+149        n_clusters = self.C
+150        kmeans = KMeans(n_clusters=n_clusters, init="k–means++", max_iter=500, algorithm='auto')
+151        fitted = kmeans.fit(X)
+152        prediction = kmeans.predict(X)
+153        self._initial_means, self._initial_cov, self._initial_pi = self.calculate_mean_covariance(X, prediction)
+154
+155        return (self._initial_means, self._initial_cov, self._initial_pi)
+156
+157    def _e_step(self, X, pi, mu, sigma):
+158        """Performs E–step on GMM model
+159        Parameters:
+160        ––––––––––––
+161        X: (N x d), data points, m: no of features
+162        pi: (C), weights of mixture components
+163        mu: (C x d), mixture component means
+164        sigma: (C x d x d), mixture component covariance matrices
+165        Returns:
+166        ––––––––––
+167        gamma: (N x C), probabilities of clusters for objects
+168        """
+169        N = X.shape[0]
+170        self.gamma = np.zeros((N, self.C))
+171
+172        const_c = np.zeros(self.C)
+173
+174        self.mu = self.mu if self._initial_means is None else self._initial_means
+175        self.pi = self.pi if self._initial_pi is None else self._initial_pi
+176        self.sigma = self.sigma if self._initial_cov is None else self._initial_cov
+177
+178        for c in range(self.C):
+179            # Posterior Distribution using Bayes Rule
+180            self.gamma[:, c] = self.pi[c] * mvn.pdf(X, self.mu[c, :], self.sigma[c])
+181
+182        # normalize across columns to make a valid probability
+183        gamma_norm = np.sum(self.gamma, axis=1)[:, np.newaxis]
+184        self.gamma /= gamma_norm
+185
+186        return self.gamma
+187
+188    def _m_step(self, X, gamma):
+189        """Performs M–step of the GMM
+190        We need to update our priors, our means
+191        and our covariance matrix.
+192        Parameters:
+193        –––––––––––
+194        X: (N x d), data
+195        gamma: (N x C), posterior distribution of lower bound
+196        Returns:
+197        –––––––––
+198        pi: (C)
+199        mu: (C x d)
+200        sigma: (C x d x d)
+201        """
+202        N = X.shape[0]  # number of objects
+203        C = self.gamma.shape[1]  # number of clusters
+204        d = X.shape[1]  # dimension of each object
+205
+206        # responsibilities for each gaussian
+207        self.pi = np.mean(self.gamma, axis=0)
+208
+209        self.mu = np.dot(self.gamma.T, X) / np.sum(self.gamma, axis=0)[:, np.newaxis]
+210
+211        for c in range(C):
+212            x = X – self.mu[c, :]  # (N x d)
+213
+214            gamma_diag = np.diag(self.gamma[:, c])
+215            x_mu = np.matrix(x)
+216            gamma_diag = np.matrix(gamma_diag)
+217
+218            sigma_c = x.T * gamma_diag * x
+219            self.sigma[c, :, :] = (sigma_c) / np.sum(self.gamma, axis=0)[:, np.newaxis][c]
+220
+221        return self.pi, self.mu, self.sigma
+222
+223    def _compute_loss_function(self, X, pi, mu, sigma):
+224        """Computes lower bound loss function
+225
+226        Parameters:
+227        –––––––––––
+228        X: (N x d), data
+229
+230        Returns:
+231        –––––––––
+232        pi: (C)
+233        mu: (C x d)
+234        sigma: (C x d x d)
+235        """
+236        N = X.shape[0]
+237        C = self.gamma.shape[1]
+238        self.loss = np.zeros((N, C))
+239
+240        for c in range(C):
+241            dist = mvn(self.mu[c], self.sigma[c], allow_singular=True)
+242            self.loss[:, c] = self.gamma[:, c] * (
+243                        np.log(self.pi[c] + 0.00001) + dist.logpdf(X) – np.log(self.gamma[:, c] + 0.000001))
+244        self.loss = np.sum(self.loss)
+245        return self.loss
+246
+247    def fit(self, X):
+248        """Compute the E–step and M–step and
+249            Calculates the lowerbound
+250
+251        Parameters:
+252        –––––––––––
+253        X: (N x d), data
+254
+255        Returns:
+256        ––––––––––
+257        instance of GMM
+258
+259        """
+260
+261        d = X.shape[1]
+262        self.mu, self.sigma, self.pi = self._initialise_parameters(X)
+263
+264        try:
+265            for run in range(self.n_runs):
+266                self.gamma = self._e_step(X, self.mu, self.pi, self.sigma)
+267                self.pi, self.mu, self.sigma = self._m_step(X, self.gamma)
+268                loss = self._compute_loss_function(X, self.pi, self.mu, self.sigma)
+269
+270                if run % 10 == 0:
+271                    print("Iteration: %d Loss: %0.6f" % (run, loss))
+272
+273
+274        except Exception as e:
+275            print(e)
+276
+277        return self
+278
+279    def predict(self, X):
+280        """Returns predicted labels using Bayes Rule to
+281        Calculate the posterior distribution
+282
+283        Parameters:
+284        –––––––––––––
+285        X: N*d numpy array
+286
+287        Returns:
+288        ––––––––––
+289        labels: predicted cluster based on
+290        highest responsibility gamma.
+291
+292        """
+293        labels = np.zeros((X.shape[0], self.C))
+294
+295        for c in range(self.C):
+296            labels[:, c] = self.pi[c] * mvn.pdf(X, self.mu[c, :], self.sigma[c])
+297        labels = labels.argmax(1)
+298        return labels
+299
+300    def predict_proba(self, X):
+301        """Returns predicted labels
+302
+303        Parameters:
+304        –––––––––––––
+305        X: N*d numpy array
+306
+307        Returns:
+308        ––––––––––
+309        labels: predicted cluster based on
+310        highest responsibility gamma.
+311
+312        """
+313        post_proba = np.zeros((X.shape[0], self.C))
+314
+315        for c in range(self.C):
+316            # Posterior Distribution using Bayes Rule
+317            post_proba[:, c] = self.pi[c] * mvn.pdf(X, self.mu[c, :], self.sigma[c])
+318
+319        return post_proba
+320
+321
+322 def draw_ellipse(position, covariance, ax=None, **kwargs):
+323    """Draw an ellipse with a given position and covariance"""
+324    ax = ax or plt.gca()
+325
+326    # Convert covariance to principal axes
+327    if covariance.shape == (2, 2):
+328        U, s, Vt = np.linalg.svd(covariance)
+329        angle = np.degrees(np.arctan2(U[1, 0], U[0, 0]))
+330        width, height = 2 * np.sqrt(s)
+331    else:
+332        angle = 0
+333        width, height = 2 * np.sqrt(covariance)
+334
+335    # Draw the Ellipse
+336    for nsig in range(1, 4):
+337        ax.add_patch(Ellipse(position, nsig * width, nsig * height,
+338                                angle, **kwargs))
+339
+340 model = GMM(3, n_runs=30)
+341
+342 fitted_values = model.fit(Y_sklearn)
+343 predicted_values = model.predict(Y_sklearn)
+344
+345 # # compute centers as point of highest density of distribution
+346 centers = np.zeros((3, 2))
+347 for i in range(model.C):
+348    density = mvn(cov=model.sigma[i], mean=model.mu[i]).logpdf(Y_sklearn)
+349    centers[i, :] = Y_sklearn[np.argmax(density)]
+350
+351 plt.figure(figsize=(10, 8))
+352 plt.scatter(Y_sklearn[:, 0], Y_sklearn[:, 1], c=predicted_values, s=50, cmap='viridis', zorder=1)
+353
+354 plt.scatter(centers[:, 0], centers[:, 1], c='black', s=300, alpha=0.5, zorder=2);
+355
+356 w_factor = 0.2 / model.pi.max()
+357
+358 for pos, covar, w in zip(model.mu, model.sigma, model.pi):
+359    draw_ellipse(pos, covar, alpha=w)
+360
+361 plt.show()
